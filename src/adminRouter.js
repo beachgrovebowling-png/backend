@@ -484,6 +484,16 @@ router.put('/orders/:id', requireDatabase, async (request, response, next) => {
   } catch (error) { next(error); }
 });
 
+router.delete('/orders/:id([a-fA-F0-9]{24})', requireDatabase, async (request, response, next) => {
+  try {
+    const order = await Order.findById(request.params.id);
+    if (!order) return response.status(404).json({ error: 'Order request not found.' });
+    await order.deleteOne();
+    await logActivity(request.session.admin, 'order.delete', 'order', order._id, `Deleted order ${order.reference}`);
+    response.status(204).end();
+  } catch (error) { next(error); }
+});
+
 router.get('/orders.csv', requireDatabase, async (request, response, next) => {
   try {
     const orders = await Order.find().sort({ createdAt: -1 }).limit(10000).lean();

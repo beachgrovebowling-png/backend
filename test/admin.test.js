@@ -169,6 +169,13 @@ test('admin authentication, CSRF, private dashboard, and logout use Mongo-backed
 
     const orderMissing = await fetch(`${baseUrl}/api/admin/orders/aaaaaaaaaaaaaaaaaaaaaaaa`, { headers: { Cookie: cookie } });
     assert.equal(orderMissing.status, 404);
+    const deleteOrderResponse = await fetch(`${baseUrl}/api/admin/orders/${orderId}`, {
+      method: 'DELETE', headers: { Cookie: cookie, 'x-csrf-token': login.csrfToken }
+    });
+    assert.equal(deleteOrderResponse.status, 204);
+    assert.equal(await Order.findById(orderId), null);
+    const deletedOrderResponse = await fetch(`${baseUrl}/api/admin/orders/${orderId}`, { headers: { Cookie: cookie } });
+    assert.equal(deletedOrderResponse.status, 404);
 
     const logout = await fetch(`${baseUrl}/api/admin/logout`, { method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': login.csrfToken } });
     assert.equal(logout.status, 204);
