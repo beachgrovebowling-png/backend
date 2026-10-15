@@ -1,5 +1,6 @@
 require('dotenv').config();
 
+const fs = require('node:fs');
 const express = require('express');
 const mongoose = require('mongoose');
 const path = require('node:path');
@@ -19,6 +20,7 @@ const adminRouter = require('./src/adminRouter');
 
 const app = express();
 const publicDirectory = path.join(__dirname, '..', 'frontend', 'public');
+const hasStaticFrontend = fs.existsSync(publicDirectory) && fs.existsSync(path.join(publicDirectory, 'index.html'));
 const rawFrontendUrl = String(process.env.FRONTEND_URL || '').trim();
 const isCrossSiteFrontend = Boolean(rawFrontendUrl) && !rawFrontendUrl.includes('localhost');
 const sessionCookieSameSite = String(process.env.SESSION_COOKIE_SAME_SITE || (isCrossSiteFrontend ? 'none' : 'strict')).toLowerCase();
@@ -28,10 +30,29 @@ const sessionCookieOptions = {
   secure: process.env.NODE_ENV === 'production' || process.env.SESSION_COOKIE_SECURE === 'true',
   maxAge: 8 * 60 * 60 * 1000
 };
+const allowedOrigins = Array.from(new Set([
+  rawFrontendUrl,
+  process.env.CORS_ORIGINS || '',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:3001',
+  'http://127.0.0.1:3001'
+].flatMap(value => String(value || '').split(',')).map(item => item.trim()).filter(Boolean)));
 if (process.env.NODE_ENV === 'production' && (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32)) {
   throw new Error('SESSION_SECRET must be configured with at least 32 characters in production.');
 }
 
+app.use((request, response, next) => {
+  const origin = request.headers.origin;
+  if (origin && allowedOrigins.includes(origin)) {
+    response.setHeader('Access-Control-Allow-Origin', origin);
+    response.setHeader('Access-Control-Allow-Credentials', 'true');
+    response.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    response.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-CSRF-Token, Cookie');
+  }
+  if (request.method === 'OPTIONS') return response.sendStatus(204);
+  next();
+});
 app.use(express.urlencoded({ extended: false, limit: '12kb' }));
 app.use(express.json({ limit: '12kb' }));
 app.use(helmet({
@@ -69,10 +90,22 @@ app.use(session({
   saveUninitialized: false,
   cookie: sessionCookieOptions
 }));
-app.use(express.static(publicDirectory));
+if (hasStaticFrontend) {
+  app.use(express.static(publicDirectory));
+}
 app.use('/media', express.static(localDirectory, { fallthrough: false, immutable: true, maxAge: '1y' }));
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' } });
 app.use('/api/admin/login', loginLimiter);
+app.get('/api/health', async (request, response) => {
+  const databaseConnected = mongoose.connection.readyState === 1;
+  response.json({
+    status: 'ok',
+    environment: process.env.NODE_ENV || 'development',
+    databaseConnected,
+    frontendConfigured: Boolean(rawFrontendUrl),
+    timestamp: new Date().toISOString()
+  });
+});
 app.use('/api/admin', csrfProtection, adminRouter);
 
 function publicProduct(product) {
@@ -230,18 +263,19 @@ function cryptoRandomReference() {
   return require('node:crypto').randomBytes(3).toString('hex').toUpperCase();
 }
 
-app.get(['/admin', '/admin/*'], (request, response) => response.sendFile(path.join(publicDirectory, 'admin.html')));
+if (hasStaticFrontend) {
+  app.get(['/admin', '/admin/*'], (request, response) => response.sendFile(path.join(publicDirectory, 'admin.html')));
+  app.get('*', (request, response) => {
+    response.sendFile(path.join(publicDirectory, 'index.html'));
+  });
+}
 
 app.use('/api', (request, response) => response.status(404).json({ error: 'API endpoint not found.' }));
 
-app.get('*', (request, response) => {
-  response.sendFile(path.join(publicDirectory, 'index.html'));
-});
-
 app.use((error, request, response, next) => {
   if (response.headersSent) return next(error);
-  console.error(`Request failed: ${error.message}`);
   const status = error instanceof require('multer').MulterError ? 400 : (error.status >= 400 && error.status < 600 ? error.status : 500);
+  console.error(`Request failed: ${request.method} ${request.originalUrl} -> ${error.message}`);
   response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
 });
 
