@@ -19,6 +19,7 @@ const { localDirectory, storageStatus } = require('./src/storage');
 const adminRouter = require('./src/adminRouter');
 
 const app = express();
+app.set('trust proxy', 1);
 const publicDirectory = path.join(__dirname, '..', 'frontend', 'public');
 const hasStaticFrontend = fs.existsSync(publicDirectory) && fs.existsSync(path.join(publicDirectory, 'index.html'));
 const rawFrontendUrl = String(process.env.FRONTEND_URL || '').trim();
