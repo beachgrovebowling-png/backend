@@ -50,9 +50,10 @@ test('HTTP endpoints expose readiness only and refuse incomplete WhatsApp redire
   try {
     const catalogueResponse = await fetch(`${baseUrl}/api/products`);
     const catalogue = await catalogueResponse.json();
-    assert.equal(catalogue.catalogMode, 'starter-preview');
-    assert.equal(catalogue.whatsappConfigured, false);
-    assert.equal(JSON.stringify(catalogue).includes('12025550142'), false);
+    assert.equal(catalogueResponse.status, 503);
+    assert.match(catalogueResponse.headers.get('cache-control'), /no-store/);
+    assert.match(catalogue.error, /database is not connected/);
+    assert.equal(Object.hasOwn(catalogue, 'products'), false);
 
     const orderResponse = await fetch(`${baseUrl}/api/orders/whatsapp`, {
       method: 'POST',
@@ -79,4 +80,11 @@ test('HTTP endpoints expose readiness only and refuse incomplete WhatsApp redire
     if (previousNumber === undefined) delete process.env.WHATSAPP_NUMBER;
     else process.env.WHATSAPP_NUMBER = previousNumber;
   }
+});
+
+test('order pricing uses the current confirmed database price and sale price', () => {
+  const body = { customerName: 'Alex Rider', customerPhone: '+1 202 555 0142', productId: 'storm-ice-spare-ball', quantity: '2', paymentMethod: 'Zelle' };
+  const products = [{ slug: 'storm-ice-spare-ball', name: 'Spare Ball', brand: 'Storm', price: 180, salePrice: 145, priceConfirmed: true }];
+  assert.equal(validateOrder(body, products).order.product.price, 145);
+  assert.equal(validateOrder(body, [{ ...products[0], salePrice: null }]).order.product.price, 180);
 });

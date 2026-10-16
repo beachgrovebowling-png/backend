@@ -7,7 +7,6 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "seed": "node scripts/seed.js",
     "admin:create": "node scripts/create-admin.js",
     "admin:create:interactive": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/create-admin.ps1",
     "test": "node --test test/*.test.js"

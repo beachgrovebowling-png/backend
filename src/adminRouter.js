@@ -79,7 +79,7 @@ async function validateProduct(body) {
     availability: ['available', 'out-of-stock', 'contact'].includes(body.availability) ? body.availability : 'contact',
     condition: ['unspecified', 'new', 'used', 'refurbished'].includes(body.condition) ? body.condition : 'unspecified',
     specifications, tags,
-    featured: Boolean(body.featured), active: status === 'published', status,
+    featured: Boolean(body.featured), isStarter: false, active: status === 'published', status,
     seoTitle: cleanText(body.seoTitle, 180), seoDescription: cleanText(body.seoDescription, 320)
   } };
 }

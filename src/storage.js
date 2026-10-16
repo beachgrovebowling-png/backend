@@ -10,6 +10,10 @@ function isR2Configured() {
   return Boolean(process.env.R2_ACCOUNT_ID && process.env.R2_ACCESS_KEY_ID && process.env.R2_SECRET_ACCESS_KEY && process.env.R2_BUCKET && process.env.R2_PUBLIC_BASE_URL);
 }
 
+function isPersistentLocalStorageConfigured() {
+  return process.env.MEDIA_LOCAL_PERSISTENT === 'true' && Boolean(process.env.MEDIA_LOCAL_DIRECTORY);
+}
+
 function getR2Client() {
   return new S3Client({
     region: 'auto',
@@ -21,6 +25,9 @@ function getR2Client() {
 async function putImage(buffer, mimeType) {
   const extension = mimeExtensions[mimeType];
   if (!extension) throw new Error('Unsupported image format.');
+  if (process.env.NODE_ENV === 'production' && !isR2Configured() && !isPersistentLocalStorageConfigured()) {
+    throw new Error('Persistent image storage is not configured. Set the R2 storage variables or point MEDIA_LOCAL_DIRECTORY at a mounted persistent disk and set MEDIA_LOCAL_PERSISTENT=true.');
+  }
   const key = `${new Date().toISOString().slice(0, 10)}/${crypto.randomUUID()}${extension}`;
   if (isR2Configured()) {
     await getR2Client().send(new PutObjectCommand({ Bucket: process.env.R2_BUCKET, Key: key, Body: buffer, ContentType: mimeType, CacheControl: 'public, max-age=31536000, immutable' }));
@@ -45,7 +52,8 @@ async function deleteImage(media) {
 }
 
 function storageStatus() {
-  return { provider: isR2Configured() ? 'Cloudflare R2' : 'Local disk', persistentAcrossDeploys: isR2Configured(), configured: isR2Configured() || Boolean(process.env.MEDIA_LOCAL_DIRECTORY || true) };
+  const persistentAcrossDeploys = isR2Configured() || isPersistentLocalStorageConfigured();
+  return { provider: isR2Configured() ? 'Cloudflare R2' : 'Local disk', persistentAcrossDeploys, configured: process.env.NODE_ENV !== 'production' || persistentAcrossDeploys };
 }
 
 module.exports = { deleteImage, isR2Configured, localDirectory, putImage, storageStatus };

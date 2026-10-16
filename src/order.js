@@ -11,13 +11,6 @@ function configuredWhatsAppNumber(value = process.env.WHATSAPP_NUMBER) {
   return digits.length >= 8 && digits.length <= 15 && digits[0] !== '0' && !isFictionalNanpNumber ? digits : null;
 }
 
-function stormIceOrderPrice(productSlug, quantity) {
-  if (String(productSlug || '').toLowerCase() !== 'storm-ice-spare-ball') return null;
-  if (Number(quantity) === 2) return 170;
-  if (Number(quantity) === 1) return 100;
-  return null;
-}
-
 function validateOrder(body, products) {
   const customerName = String(body.customerName || '').trim();
   const customerPhone = String(body.customerPhone || '').trim();
@@ -37,8 +30,9 @@ function validateOrder(body, products) {
   const product = products.find(item => String(item._id || item.slug) === productId || item.slug === productId);
   if (!product) return { error: 'That product is no longer available. Refresh the catalogue and try again.' };
 
-  const stormIcePrice = stormIceOrderPrice(product.slug, quantity);
-  const resolvedPrice = stormIcePrice ?? (product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null);
+  const resolvedPrice = product.priceConfirmed === true
+    ? (Number.isFinite(product.salePrice) ? product.salePrice : Number.isFinite(product.price) ? product.price : null)
+    : null;
 
   return {
     order: {

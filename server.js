@@ -12,7 +12,6 @@ const Product = require('./src/models/Product');
 const Category = require('./src/models/Category');
 const Order = require('./src/models/Order');
 const SiteSettings = require('./src/models/SiteSettings');
-const { catalogCategories, starterProducts } = require('./src/catalog');
 const { buildWhatsAppMessage, configuredWhatsAppNumber, validateOrder } = require('./src/order');
 const { csrfProtection } = require('./src/security');
 const { localDirectory, storageStatus } = require('./src/storage');
@@ -115,7 +114,7 @@ function publicProduct(product) {
     : product.stockQuantity == null && product.availability !== 'out-of-stock'
       ? 'contact'
       : (product.availability || 'contact');
-  const resolvedPrice = product.pricingRule === 'storm-ice-quantity-offer' && Number.isInteger(product.price) ? product.price : (product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null);
+  const resolvedPrice = product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null;
   const weights = Array.isArray(product.weights) ? product.weights.map(weight => ({ label: String(weight.label || `${weight.value} lb`), value: Number(weight.value), available: Boolean(weight.available ?? true) })) : [];
   return {
     id: String(product._id || product.slug),
@@ -153,19 +152,20 @@ function errorPage(message, status) {
 }
 
 app.get('/api/products', async (request, response) => {
-  const databaseConnected = mongoose.connection.readyState === 1;
+  response.set({ 'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate', Pragma: 'no-cache', Expires: '0' });
+  if (mongoose.connection.readyState !== 1) {
+    return response.status(503).json({ error: 'Product catalogue is unavailable because the database is not connected.' });
+  }
   try {
-    const products = databaseConnected
-      ? await Product.find({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).sort({ featured: -1, name: 1 }).lean()
-      : starterProducts;
-    const categories = databaseConnected ? await Category.find({ published: true }).sort({ sortOrder: 1, name: 1 }).select('slug name').lean() : [];
-    const settings = databaseConnected ? await SiteSettings.findOne({ key: 'main' }).lean() : null;
+    const products = await Product.find({ active: true, isStarter: { $ne: true }, $or: [{ status: 'published' }, { status: { $exists: false } }] }).sort({ featured: -1, name: 1 }).lean();
+    const categories = await Category.find({ published: true }).sort({ sortOrder: 1, name: 1 }).select('slug name').lean();
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
     response.json({
       products: products.map(publicProduct),
       categories,
       site: publicSiteSettings(settings?.data),
-      databaseConnected,
-      catalogMode: databaseConnected ? 'database' : 'starter-preview',
+      databaseConnected: true,
+      catalogMode: 'database',
       whatsappConfigured: Boolean(orderWhatsAppNumber(settings?.data))
     });
   } catch (error) {
@@ -241,7 +241,7 @@ app.post('/api/orders/whatsapp', async (request, response) => {
     const order = await Order.create({
       reference,
       customer: { name: result.order.customerName, phone: result.order.customerPhone, email: result.order.email },
-      product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null, quantity: result.order.quantity },
+      product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: result.order.product.price, quantity: result.order.quantity },
       requirements: result.order.requirements,
       status: 'request-recorded',
       history: [{ status: 'request-recorded', note: 'Customer submitted the website form; WhatsApp message may not have been sent.' }]
@@ -280,28 +280,15 @@ app.use((error, request, response, next) => {
   response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
 });
 
-async function ensureCatalogSeed() {
-  if (mongoose.connection.readyState !== 1) return;
-  const categoryCount = await Category.countDocuments();
-  if (categoryCount === 0) {
-    await Category.insertMany(catalogCategories.map(category => ({ ...category, slug: String(category.slug).trim().toLowerCase() })));
-  }
-  const productCount = await Product.countDocuments();
-  if (productCount === 0) {
-    await Product.insertMany(starterProducts.map(product => ({ ...product, slug: String(product.slug).trim().toLowerCase() })));
-  }
-}
-
 function connectDatabase() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
-    console.warn('MONGODB_URI is not set. Serving the read-only starter catalogue; product changes are not persistent.');
+    console.warn('MONGODB_URI is not set. Public catalogue requests will fail until MongoDB is connected.');
     return Promise.resolve(false);
   }
 
-  return mongoose.connect(uri).then(async () => {
+  return mongoose.connect(uri).then(() => {
     sessionStore.use(MongoStore.create({ client: mongoose.connection.getClient(), dbName: mongoose.connection.name, collectionName: 'admin_sessions', ttl: 8 * 60 * 60 }));
-    await ensureCatalogSeed();
     console.log('Connected to MongoDB.');
     return true;
   }).catch(error => {
