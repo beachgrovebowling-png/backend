@@ -14,7 +14,7 @@ const Order = require('./src/models/Order');
 const SiteSettings = require('./src/models/SiteSettings');
 const { buildWhatsAppMessage, configuredWhatsAppNumber, validateOrder } = require('./src/order');
 const { csrfProtection } = require('./src/security');
-const { checkR2Connection, localDirectory, logR2ConnectionResult, storageStatus } = require('./src/storage');
+const { checkR2Connection, classifyR2Error, localDirectory, logR2ConnectionResult, storageStatus } = require('./src/storage');
 const adminRouter = require('./src/adminRouter');
 
 const app = express();
@@ -83,6 +83,7 @@ class DelegatingSessionStore extends session.Store {
 
 const sessionStore = new DelegatingSessionStore();
 let r2Connectivity = { configured: false, connected: false, category: 'not_checked' };
+let databaseStartup = Promise.resolve(false);
 app.use(session({
   name: 'bm.admin.sid',
   secret: process.env.SESSION_SECRET || 'development-only-change-this-session-secret-before-deploying',
@@ -97,6 +98,9 @@ if (hasStaticFrontend) {
 app.use('/media', express.static(localDirectory, { fallthrough: false, immutable: true, maxAge: '1y' }));
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' } });
 app.use('/api/admin/login', loginLimiter);
+app.use('/api/admin', (request, response, next) => {
+  databaseStartup.then(() => next(), () => next());
+});
 app.get('/api/health', async (request, response) => {
   const databaseConnected = mongoose.connection.readyState === 1;
   response.json({
@@ -278,6 +282,12 @@ app.use('/api', (request, response) => response.status(404).json({ error: 'API e
 app.use((error, request, response, next) => {
   if (response.headersSent) return next(error);
   const status = error instanceof require('multer').MulterError ? 400 : (error.status >= 400 && error.status < 600 ? error.status : 500);
+  const r2Error = error.$metadata || /^S3(Service|Exception)/.test(String(error.name || ''));
+  if (r2Error) {
+    const detail = classifyR2Error(error);
+    console.error(`Request failed: ${request.method} ${request.originalUrl} -> R2 ${detail.category}, ${detail.errorName}, HTTP ${detail.httpStatus || 'unknown'}.`);
+    return response.status(502).json({ error: 'Image storage request failed.', storageError: detail.category });
+  }
   console.error(`Request failed: ${request.method} ${request.originalUrl} -> ${error.message}`);
   response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
 });
@@ -301,6 +311,7 @@ function connectDatabase() {
 
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
+  databaseStartup = connectDatabase();
   checkR2Connection().then(result => {
     r2Connectivity = result;
     logR2ConnectionResult(result);
@@ -308,7 +319,6 @@ if (require.main === module) {
     r2Connectivity = { configured: null, connected: false, category: 'probe_failed' };
     console.error('Cloudflare R2 connectivity check could not complete.');
   });
-  connectDatabase();
   const server = app.listen(port, () => console.log(`BowlersMechanic is running at http://localhost:${port}`));
   const shutdown = () => server.close(() => mongoose.disconnect().finally(() => process.exit(0)));
   process.on('SIGINT', shutdown);

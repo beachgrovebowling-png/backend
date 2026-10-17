@@ -111,4 +111,4 @@ function storageStatus() {
   return { provider: isR2Configured() ? 'Cloudflare R2' : 'Local disk', persistentAcrossDeploys, configured: process.env.NODE_ENV !== 'production' || persistentAcrossDeploys };
 }
 
-module.exports = { checkR2Connection, deleteImage, isR2Configured, localDirectory, logR2ConnectionResult, putImage, storageStatus };
+module.exports = { checkR2Connection, classifyR2Error, deleteImage, isR2Configured, localDirectory, logR2ConnectionResult, putImage, storageStatus };
