@@ -14,7 +14,7 @@ const Order = require('./src/models/Order');
 const SiteSettings = require('./src/models/SiteSettings');
 const { buildWhatsAppMessage, configuredWhatsAppNumber, validateOrder } = require('./src/order');
 const { csrfProtection } = require('./src/security');
-const { localDirectory, storageStatus } = require('./src/storage');
+const { checkR2Connection, localDirectory, logR2ConnectionResult, storageStatus } = require('./src/storage');
 const adminRouter = require('./src/adminRouter');
 
 const app = express();
@@ -82,6 +82,7 @@ class DelegatingSessionStore extends session.Store {
 }
 
 const sessionStore = new DelegatingSessionStore();
+let r2Connectivity = { configured: false, connected: false, category: 'not_checked' };
 app.use(session({
   name: 'bm.admin.sid',
   secret: process.env.SESSION_SECRET || 'development-only-change-this-session-secret-before-deploying',
@@ -103,6 +104,7 @@ app.get('/api/health', async (request, response) => {
     environment: process.env.NODE_ENV || 'development',
     databaseConnected,
     frontendConfigured: Boolean(rawFrontendUrl),
+    r2: r2Connectivity,
     timestamp: new Date().toISOString()
   });
 });
@@ -299,6 +301,13 @@ function connectDatabase() {
 
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
+  checkR2Connection().then(result => {
+    r2Connectivity = result;
+    logR2ConnectionResult(result);
+  }).catch(() => {
+    r2Connectivity = { configured: null, connected: false, category: 'probe_failed' };
+    console.error('Cloudflare R2 connectivity check could not complete.');
+  });
   connectDatabase();
   const server = app.listen(port, () => console.log(`BowlersMechanic is running at http://localhost:${port}`));
   const shutdown = () => server.close(() => mongoose.disconnect().finally(() => process.exit(0)));
