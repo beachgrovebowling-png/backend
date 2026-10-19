@@ -98,6 +98,7 @@ if (hasStaticFrontend) {
 app.use('/media', express.static(localDirectory, { fallthrough: false, immutable: true, maxAge: '1y' }));
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' } });
 app.use('/api/admin/login', loginLimiter);
+const orderRequestLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many order requests. Please wait before trying again.' } });
 app.use('/api/admin', (request, response, next) => {
   databaseStartup.then(() => next(), () => next());
 });
@@ -187,7 +188,7 @@ function publicSiteSettings(data = {}) {
   const footer = data.footer || {};
   const navigation = Array.isArray(data.navigation) ? data.navigation : [];
   return {
-    site: { name: String(site.name || 'BowlersMechanic').slice(0, 100), currency: 'USD', announcement: String(site.announcement || '').slice(0, 240), announcementVisible: Boolean(site.announcementVisible), contactEmail: String(site.contactEmail || '').slice(0, 254), contactPhone: String(site.contactPhone || '').slice(0, 30) },
+    site: { name: String(site.name || 'BowlersMechanic').slice(0, 100), currency: 'USD', announcement: String(site.announcement || '').slice(0, 240), announcementVisible: Boolean(site.announcementVisible), contactEmail: String(site.contactEmail || '').slice(0, 254), contactPhone: String(site.contactPhone || '').slice(0, 30), whatsappNumber: orderWhatsAppNumber(data) },
     homepage: {
       headline: String(homepage.headline || 'Find your next strike.').slice(0, 120),
       subtitle: String(homepage.subtitle || 'The right gear changes how you play. Explore the catalogue and talk directly with BowlersMechanic about your next setup.').slice(0, 500),
@@ -209,6 +210,45 @@ function safePublicUrl(value) {
   const url = String(value || '').trim();
   return url.startsWith('/') || /^https:\/\//i.test(url) ? url.slice(0, 300) : '#';
 }
+
+async function recordOrderRequest(body, settingsData = {}) {
+  if (mongoose.connection.readyState !== 1) return { error: 'The order service is unavailable because the catalogue database is not connected.', status: 503 };
+  const products = await Product.find({ active: true, isStarter: { $ne: true }, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
+  const result = validateOrder(body, products);
+  if (result.error) return { error: result.error, status: 400 };
+  const product = products.find(item => String(item._id || item.slug) === String(body.productId) || item.slug === String(body.productId));
+  const whatsappConfig = settingsData.whatsapp || {};
+  const prefix = String(whatsappConfig.referencePrefix || 'BM').replace(/[^A-Za-z0-9-]/g, '').slice(0, 8) || 'BM';
+  const reference = `${prefix}-${new Date().toISOString().slice(2, 10).replace(/-/g, '')}-${cryptoRandomReference()}`;
+  const order = await Order.create({
+    reference,
+    customer: { name: result.order.customerName, phone: result.order.customerPhone, email: result.order.email },
+    product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: result.order.product.price, quantity: result.order.quantity },
+    requirements: result.order.requirements,
+    status: 'request-recorded',
+    history: [{ status: 'request-recorded', note: 'Customer submitted an order request through the website; owner follow-up is pending.' }]
+  });
+  console.info(`Order request ${order.reference} recorded; customer follow-up is pending.`);
+  return { order, product, validated: result.order };
+}
+
+app.post('/api/orders', orderRequestLimiter, async (request, response) => {
+  if (mongoose.connection.readyState !== 1) return response.status(503).json({ error: 'The order service is temporarily unavailable. Please try again.' });
+  try {
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
+    const result = await recordOrderRequest(request.body, settings?.data || {});
+    if (result.error) return response.status(result.status).json({ error: result.error });
+    response.status(201).json({
+      reference: result.order.reference,
+      product: { name: result.product.name, brand: result.product.brand },
+      whatsappNumber: orderWhatsAppNumber(settings?.data),
+      contactEmail: String(settings?.data?.site?.contactEmail || '').trim()
+    });
+  } catch (error) {
+    console.error(`Could not record order request: ${error.message}`);
+    response.status(503).json({ error: 'The order request could not be saved. Please try again.' });
+  }
+});
 
 app.get('/api/site-config', async (request, response) => {
   try {
@@ -237,29 +277,16 @@ app.post('/api/orders/whatsapp', async (request, response) => {
 
   try {
     if (mongoose.connection.readyState !== 1) return response.status(503).type('html').send(errorPage('The order service is unavailable because the catalogue database is not connected. Your request was not recorded.', 503));
-    const products = await Product.find({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
-    const result = validateOrder(request.body, products);
-    if (result.error) return response.status(400).type('html').send(errorPage(result.error, 400));
-
-    const product = products.find(item => String(item._id || item.slug) === String(request.body.productId) || item.slug === String(request.body.productId));
-    const prefix = String(whatsappConfig?.referencePrefix || 'BM').replace(/[^A-Za-z0-9-]/g, '').slice(0, 8) || 'BM';
-    const reference = `${prefix}-${new Date().toISOString().slice(2, 10).replace(/-/g, '')}-${cryptoRandomReference()}`;
-    const order = await Order.create({
-      reference,
-      customer: { name: result.order.customerName, phone: result.order.customerPhone, email: result.order.email },
-      product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: result.order.product.price, quantity: result.order.quantity },
-      requirements: result.order.requirements,
-      status: 'request-recorded',
-      history: [{ status: 'request-recorded', note: 'Customer submitted the website form; WhatsApp message may not have been sent.' }]
-    });
-    const substitutions = { reference, name: result.order.customerName, product: `${product.brand} ${product.name}`, quantity: String(result.order.quantity) };
+    const result = await recordOrderRequest(request.body, settings?.data || {});
+    if (result.error) return response.status(result.status).type('html').send(errorPage(result.error, result.status));
+    const substitutions = { reference: result.order.reference, name: result.validated.customerName, product: `${result.product.brand} ${result.product.name}`, quantity: String(result.validated.quantity) };
     const customMessage = String(whatsappConfig?.defaultMessage || '').slice(0, 500).replace(/\{(reference|name|product|quantity)\}/g, (_, key) => substitutions[key]);
     const greeting = String(whatsappConfig?.greeting || '').trim().slice(0, 200);
-    const messageParts = [greeting, customMessage, buildWhatsAppMessage(result.order), `Order reference: ${reference}`].filter(Boolean);
+    const messageParts = [greeting, customMessage, buildWhatsAppMessage(result.validated), `Order reference: ${result.order.reference}`].filter(Boolean);
     const message = encodeURIComponent(messageParts.join('\n\n'));
     response.set('Referrer-Policy', 'no-referrer');
     response.redirect(303, `https://wa.me/${whatsappNumber}?text=${message}`);
-    console.info(`Order request ${order.reference} recorded; WhatsApp send status is unknown.`);
+    console.info(`WhatsApp follow-up opened for order request ${result.order.reference}; customer send status is unknown.`);
   } catch (error) {
     console.error('Could not validate order against the catalogue:', error.message);
     response.status(503).type('html').send(errorPage('The catalogue is temporarily unavailable, so this enquiry could not be checked. Please try again shortly.', 503));
