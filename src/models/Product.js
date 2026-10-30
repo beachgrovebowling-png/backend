@@ -11,6 +11,7 @@ const productSchema = new mongoose.Schema({
   sku: { type: String, default: '', trim: true, maxlength: 80 },
   image: { type: String, default: null, trim: true },
   imageAlt: { type: String, default: '', trim: true, maxlength: 240 },
+  images: { type: [{ url: String, alt: { type: String, default: '' } }], default: [] },
   gallery: { type: [{ url: String, alt: { type: String, default: '' } }], default: [] },
   price: { type: Number, default: null, min: 0 },
   salePrice: { type: Number, default: null, min: 0 },

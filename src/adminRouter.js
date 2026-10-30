@@ -62,7 +62,14 @@ async function validateProduct(body) {
   if (stockQuantity === null && body.availability === 'available') return { error: 'Enter a verified stock quantity before marking this item in stock.' };
   const specifications = Array.isArray(body.specifications) ? body.specifications.slice(0, 40).map(item => ({ name: cleanText(item.name, 80), value: cleanText(item.value, 240) })).filter(item => item.name && item.value) : [];
   const tags = Array.isArray(body.tags) ? [...new Set(body.tags.slice(0, 30).map(tag => cleanText(tag, 40)).filter(Boolean))] : [];
-  const gallery = Array.isArray(body.gallery) ? body.gallery.slice(0, 12).map(item => ({ url: cleanText(item.url, 500), alt: cleanText(item.alt, 240) })).filter(item => item.url.startsWith('/media/') || /^https:\/\//.test(item.url)) : [];
+  const submittedImages = Array.isArray(body.images) && body.images.length ? body.images : Array.isArray(body.gallery) ? body.gallery : [];
+  const images = submittedImages.slice(0, 12).map(item => {
+    const source = item && typeof item === 'object' ? item : {};
+    return { url: cleanText(typeof item === 'string' ? item : source.url, 500), alt: cleanText(typeof item === 'string' ? '' : source.alt, 240) };
+  }).filter((item, index, list) => (item.url.startsWith('/media/') || /^https:\/\//.test(item.url)) && list.findIndex(candidate => candidate.url === item.url) === index);
+  const mainImage = cleanText(body.image, 500) || null;
+  const coverImage = images.find(item => item.url === mainImage) || images[0] || null;
+  const gallery = images.filter(item => item.url !== coverImage?.url);
   const status = body.status === 'draft' ? 'draft' : 'published';
   return { product: {
     name, brand, slug, category,
@@ -70,8 +77,8 @@ async function validateProduct(body) {
     description: cleanText(body.shortDescription || body.description, 1200),
     shortDescription: cleanText(body.shortDescription || body.description, 280),
     fullDescription: cleanText(body.fullDescription || body.description, 8000),
-    image: cleanText(body.image, 500) || null,
-    imageAlt: cleanText(body.imageAlt, 240), gallery,
+    image: coverImage?.url || mainImage,
+    imageAlt: cleanText(body.imageAlt || coverImage?.alt, 240), images, gallery,
     price, salePrice,
     priceConfirmed: Boolean(body.priceConfirmed && price !== null),
     stockQuantity,

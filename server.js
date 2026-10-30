@@ -123,6 +123,12 @@ function publicProduct(product) {
       : (product.availability || 'contact');
   const resolvedPrice = product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null;
   const weights = Array.isArray(product.weights) ? product.weights.map(weight => ({ label: String(weight.label || `${weight.value} lb`), value: Number(weight.value), available: Boolean(weight.available ?? true) })) : [];
+  const legacyImages = Array.isArray(product.images) && product.images.length
+    ? product.images
+    : [...(product.image ? [{ url: product.image, alt: product.imageAlt || '' }] : []), ...(product.gallery || [])];
+  const images = legacyImages.filter((item, index, list) => item?.url && list.findIndex(candidate => candidate?.url === item.url) === index);
+  const coverIndex = images.findIndex(item => item.url === product.image);
+  if (coverIndex > 0) images.unshift(...images.splice(coverIndex, 1));
   return {
     id: String(product._id || product.slug),
     slug: product.slug,
@@ -131,6 +137,7 @@ function publicProduct(product) {
     category: product.category,
     description: product.description,
     image: product.image || null,
+    images,
     price: resolvedPrice,
     salePrice: product.priceConfirmed === true && Number.isFinite(product.salePrice) ? product.salePrice : null,
     availability,
