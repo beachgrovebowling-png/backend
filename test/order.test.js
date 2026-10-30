@@ -29,13 +29,13 @@ test('order validation accepts only listed payment methods and includes preferen
   assert.match(validateOrder({ ...body, paymentMethod: 'Bitcoin' }, products).error, /supported payment method/);
 });
 
-test('WhatsApp message uses contact-for-price wording and no confirmation claim', () => {
+test('WhatsApp message uses contact-for-price wording without the order disclaimer', () => {
   const message = buildWhatsAppMessage({
     customerName: 'Alex Rider', customerPhone: '2025550142', email: '', quantity: 1, requirements: '',
     product: { brand: 'Motiv', name: 'Venom Shock', price: null }
   });
   assert.match(message, /Price: Contact for price/);
-  assert.match(message, /not an order confirmation/);
+  assert.doesNotMatch(message, /Please confirm availability and final order details|not an order confirmation/);
   assert.doesNotMatch(message, /\$0\.00/);
 });
 

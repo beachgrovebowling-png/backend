@@ -66,7 +66,6 @@ function buildWhatsAppMessage(order) {
     ...(order.paymentMethod ? [`Preferred payment method: ${order.paymentMethod}`] : []),
     ...(order.requirements ? [`Additional requirements: ${order.requirements}`] : []),
     '',
-    'Please confirm availability and final order details. This enquiry is not an order confirmation.',
     'Unconfirmed prices and shipping costs must be confirmed by the owner before the order is finalised.'
   ].join('\n');
 }
