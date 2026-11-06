@@ -55,6 +55,13 @@ test('HTTP endpoints expose readiness only and refuse incomplete WhatsApp redire
     assert.match(catalogue.error, /database is not connected/);
     assert.equal(Object.hasOwn(catalogue, 'products'), false);
 
+    const orderRequestResponse = await fetch(`${baseUrl}/api/orders`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ customerName: 'Alex Rider', customerPhone: '2025550142', productId: 'motiv-venom-shock', quantity: '1', paymentMethod: 'Zelle' })
+    });
+    assert.equal(orderRequestResponse.status, 503);
+    assert.match((await orderRequestResponse.json()).error, /order service is temporarily unavailable/i);
+
     const orderResponse = await fetch(`${baseUrl}/api/orders/whatsapp`, {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },

@@ -32,6 +32,7 @@ test('admin authentication, CSRF, private dashboard, and logout use Mongo-backed
   let productId;
   let mediaId;
   let orderId;
+  let independentOrderId;
   const previousSettings = await SiteSettings.findOne({ key: 'main' }).lean();
   const server = app.listen(0);
   await new Promise(resolve => server.once('listening', resolve));
@@ -93,10 +94,26 @@ test('admin authentication, CSRF, private dashboard, and logout use Mongo-backed
     assert.ok(!JSON.stringify(publicData).includes(email));
 
     const settingsForOrder = await SiteSettings.findOne({ key: 'main' }) || new SiteSettings({ key: 'main', data: {} });
-    settingsForOrder.data = { ...(settingsForOrder.data || {}), whatsapp: { enabled: true, number: '14158675309', referencePrefix: 'QATEST' } };
+    settingsForOrder.data = { ...(settingsForOrder.data || {}), whatsapp: { enabled: false, number: '', referencePrefix: 'QATEST' }, site: { ...(settingsForOrder.data?.site || {}), contactEmail: 'shop@example.com' } };
     await settingsForOrder.save();
     const orderProduct = await Product.findOne({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
     assert.ok(orderProduct, 'a published product must exist to test order recording');
+    const savedOnlyResponse = await fetch(`${baseUrl}/api/orders`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ customerName: 'Temporary order-only customer', customerPhone: '4158675309', productId: String(orderProduct._id), quantity: '1', paymentMethod: 'Zelle' })
+    });
+    assert.equal(savedOnlyResponse.status, 201);
+    const savedOnly = await savedOnlyResponse.json();
+    assert.match(savedOnly.reference, /^QATEST-/);
+    assert.equal(savedOnly.whatsappNumber, null);
+    assert.equal(savedOnly.contactEmail, 'shop@example.com');
+    const savedOnlyOrder = await Order.findOne({ reference: savedOnly.reference });
+    assert.ok(savedOnlyOrder);
+    assert.equal(savedOnlyOrder.status, 'request-recorded');
+    independentOrderId = savedOnlyOrder._id;
+
+    settingsForOrder.data.whatsapp = { enabled: true, number: '14158675309', referencePrefix: 'QATEST' };
+    await settingsForOrder.save();
     const orderResponse = await fetch(`${baseUrl}/api/orders/whatsapp`, {
       method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ customerName: 'Temporary QA Customer', customerPhone: '4158675309', productId: String(orderProduct._id), quantity: '1', paymentMethod: 'Zelle' }),
@@ -193,6 +210,7 @@ test('admin authentication, CSRF, private dashboard, and logout use Mongo-backed
     }
     await Activity.deleteMany({ actorEmail: email });
     if (orderId) await Order.deleteOne({ _id: orderId });
+    if (independentOrderId) await Order.deleteOne({ _id: independentOrderId });
     if (productId) await Product.deleteOne({ _id: productId });
     if (mediaId) {
       const media = await Media.findById(mediaId);

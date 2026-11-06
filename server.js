@@ -18,6 +18,7 @@ const { csrfProtection } = require('./src/security');
 const { localDirectory, storageStatus } = require('./src/storage');
 const { classifyDevice, detectBrowser, normalizePagePath } = require('./src/visitor');
 const { sendVisitorNotification } = require('./src/visitorNotifications');
+const { checkR2Connection, classifyR2Error, logR2ConnectionResult } = require('./src/storage');
 const adminRouter = require('./src/adminRouter');
 
 const app = express();
@@ -85,6 +86,8 @@ class DelegatingSessionStore extends session.Store {
 }
 
 const sessionStore = new DelegatingSessionStore();
+let r2Connectivity = { configured: false, connected: false, category: 'not_checked' };
+let databaseStartup = Promise.resolve(false);
 app.use(session({
   name: 'bm.admin.sid',
   secret: process.env.SESSION_SECRET || 'development-only-change-this-session-secret-before-deploying',
@@ -100,6 +103,10 @@ app.use('/media', express.static(localDirectory, { fallthrough: false, immutable
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' } });
 const visitorLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many visitor events. Try again later.' } });
 app.use('/api/admin/login', loginLimiter);
+const orderRequestLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 10, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many order requests. Please wait before trying again.' } });
+app.use('/api/admin', (request, response, next) => {
+  databaseStartup.then(() => next(), () => next());
+});
 app.get('/api/health', async (request, response) => {
   const databaseConnected = mongoose.connection.readyState === 1;
   response.json({
@@ -107,6 +114,7 @@ app.get('/api/health', async (request, response) => {
     environment: process.env.NODE_ENV || 'development',
     databaseConnected,
     frontendConfigured: Boolean(rawFrontendUrl),
+    r2: r2Connectivity,
     timestamp: new Date().toISOString()
   });
 });
@@ -306,6 +314,45 @@ function safePublicUrl(value) {
   return url.startsWith('/') || /^https:\/\//i.test(url) ? url.slice(0, 300) : '#';
 }
 
+async function recordOrderRequest(body, settingsData = {}) {
+  if (mongoose.connection.readyState !== 1) return { error: 'The order service is unavailable because the catalogue database is not connected.', status: 503 };
+  const products = await Product.find({ active: true, isStarter: { $ne: true }, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
+  const result = validateOrder(body, products);
+  if (result.error) return { error: result.error, status: 400 };
+  const product = products.find(item => String(item._id || item.slug) === String(body.productId) || item.slug === String(body.productId));
+  const whatsappConfig = settingsData.whatsapp || {};
+  const prefix = String(whatsappConfig.referencePrefix || 'BM').replace(/[^A-Za-z0-9-]/g, '').slice(0, 8) || 'BM';
+  const reference = `${prefix}-${new Date().toISOString().slice(2, 10).replace(/-/g, '')}-${cryptoRandomReference()}`;
+  const order = await Order.create({
+    reference,
+    customer: { name: result.order.customerName, phone: result.order.customerPhone, email: result.order.email },
+    product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: result.order.product.price, quantity: result.order.quantity },
+    requirements: result.order.requirements,
+    status: 'request-recorded',
+    history: [{ status: 'request-recorded', note: 'Customer submitted an order request through the website; owner follow-up is pending.' }]
+  });
+  console.info(`Order request ${order.reference} recorded; customer follow-up is pending.`);
+  return { order, product, validated: result.order };
+}
+
+app.post('/api/orders', orderRequestLimiter, async (request, response) => {
+  if (mongoose.connection.readyState !== 1) return response.status(503).json({ error: 'The order service is temporarily unavailable. Please try again.' });
+  try {
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
+    const result = await recordOrderRequest(request.body, settings?.data || {});
+    if (result.error) return response.status(result.status).json({ error: result.error });
+    response.status(201).json({
+      reference: result.order.reference,
+      product: { name: result.product.name, brand: result.product.brand },
+      whatsappNumber: orderWhatsAppNumber(settings?.data),
+      contactEmail: String(settings?.data?.site?.contactEmail || '').trim()
+    });
+  } catch (error) {
+    console.error(`Could not record order request: ${error.message}`);
+    response.status(503).json({ error: 'The order request could not be saved. Please try again.' });
+  }
+});
+
 app.get('/api/site-config', async (request, response) => {
   try {
     const connected = mongoose.connection.readyState === 1;
@@ -314,23 +361,6 @@ app.get('/api/site-config', async (request, response) => {
   } catch (error) {
     console.error('Could not load website settings:', error.message);
     response.status(503).json({ error: 'Website settings are temporarily unavailable.' });
-  }
-});
-
-app.post('/api/orders', async (request, response) => {
-  try {
-    const record = await recordOrderRequest(request.body);
-    response.status(201).json({
-      success: true,
-      order: { reference: record.reference },
-      whatsappNumber: record.whatsappNumber,
-      contactEmail: record.contactEmail,
-      message: 'Your order request has been recorded. You can continue via WhatsApp or email.'
-    });
-  } catch (error) {
-    const status = error.status >= 400 && error.status < 600 ? error.status : 500;
-    console.error('Could not record order request:', error.message);
-    response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
   }
 });
 
@@ -349,16 +379,18 @@ app.post('/api/orders/whatsapp', async (request, response) => {
   }
 
   try {
-    const record = await recordOrderRequest(request.body);
-    const whatsappConfig = record.whatsappConfig;
-    const substitutions = { reference: record.reference, name: record.result.order.customerName, product: `${record.product.brand} ${record.product.name}`, quantity: String(record.result.order.quantity) };
+    if (mongoose.connection.readyState !== 1) return response.status(503).type('html').send(errorPage('The order service is unavailable because the catalogue database is not connected. Your request was not recorded.', 503));
+    const result = await recordOrderRequest(request.body, settings?.data || {});
+    if (result.error) return response.status(result.status).type('html').send(errorPage(result.error, result.status));
+    const whatsappConfig = settings?.data?.whatsapp || {};
+    const substitutions = { reference: result.order.reference, name: result.validated.customerName, product: `${result.product.brand} ${result.product.name}`, quantity: String(result.validated.quantity) };
     const customMessage = String(whatsappConfig?.defaultMessage || '').slice(0, 500).replace(/\{(reference|name|product|quantity)\}/g, (_, key) => substitutions[key]);
     const greeting = String(whatsappConfig?.greeting || '').trim().slice(0, 200);
-    const messageParts = [greeting, customMessage, buildWhatsAppMessage(record.result.order), `Order reference: ${record.reference}`].filter(Boolean);
+    const messageParts = [greeting, customMessage, buildWhatsAppMessage(result.validated), `Order reference: ${result.order.reference}`].filter(Boolean);
     const message = encodeURIComponent(messageParts.join('\n\n'));
     response.set('Referrer-Policy', 'no-referrer');
     response.redirect(303, `https://wa.me/${whatsappNumber}?text=${message}`);
-    console.info(`Order request ${record.reference} recorded; WhatsApp send status is unknown.`);
+    console.info(`WhatsApp follow-up opened for order request ${result.order.reference}; customer send status is unknown.`);
   } catch (error) {
     const status = error.status >= 400 && error.status < 600 ? error.status : 500;
     console.error('Could not validate order against the catalogue:', error.message);
@@ -385,6 +417,12 @@ app.use('/api', (request, response) => response.status(404).json({ error: 'API e
 app.use((error, request, response, next) => {
   if (response.headersSent) return next(error);
   const status = error instanceof require('multer').MulterError ? 400 : (error.status >= 400 && error.status < 600 ? error.status : 500);
+  const r2Error = error.$metadata || /^S3(Service|Exception)/.test(String(error.name || ''));
+  if (r2Error) {
+    const detail = classifyR2Error(error);
+    console.error(`Request failed: ${request.method} ${request.originalUrl} -> R2 ${detail.category}, ${detail.errorName}, HTTP ${detail.httpStatus || 'unknown'}.`);
+    return response.status(502).json({ error: 'Image storage request failed.', storageError: detail.category });
+  }
   console.error(`Request failed: ${request.method} ${request.originalUrl} -> ${error.message}`);
   response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
 });
@@ -409,7 +447,14 @@ function connectDatabase() {
 
 if (require.main === module) {
   const port = Number(process.env.PORT) || 3000;
-  connectDatabase();
+  databaseStartup = connectDatabase();
+  checkR2Connection().then(result => {
+    r2Connectivity = result;
+    logR2ConnectionResult(result);
+  }).catch(() => {
+    r2Connectivity = { configured: null, connected: false, category: 'probe_failed' };
+    console.error('Cloudflare R2 connectivity check could not complete.');
+  });
   const server = app.listen(port, () => console.log(`BowlersMechanic is running at http://localhost:${port}`));
   const shutdown = () => server.close(() => mongoose.disconnect().finally(() => process.exit(0)));
   process.on('SIGINT', shutdown);

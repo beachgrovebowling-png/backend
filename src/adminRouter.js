@@ -65,8 +65,11 @@ async function validateProduct(body) {
   if (stockQuantity === null && body.availability === 'available') return { error: 'Enter a verified stock quantity before marking this item in stock.' };
   const specifications = Array.isArray(body.specifications) ? body.specifications.slice(0, 40).map(item => ({ name: cleanText(item.name, 80), value: cleanText(item.value, 240) })).filter(item => item.name && item.value) : [];
   const tags = Array.isArray(body.tags) ? [...new Set(body.tags.slice(0, 30).map(tag => cleanText(tag, 40)).filter(Boolean))] : [];
-  const submittedImages = Array.isArray(body.images) ? body.images : Array.isArray(body.gallery) ? body.gallery : [];
-  const images = submittedImages.slice(0, 12).map(item => ({ url: cleanText(typeof item === 'string' ? item : item.url, 500), alt: cleanText(typeof item === 'string' ? '' : item.alt, 240) })).filter(item => item.url.startsWith('/media/') || /^https:\/\//.test(item.url));
+  const submittedImages = Array.isArray(body.images) && body.images.length ? body.images : Array.isArray(body.gallery) ? body.gallery : [];
+  const images = submittedImages.slice(0, 12).map(item => {
+    const source = item && typeof item === 'object' ? item : {};
+    return { url: cleanText(typeof item === 'string' ? item : source.url, 500), alt: cleanText(typeof item === 'string' ? '' : source.alt, 240) };
+  }).filter((item, index, list) => (item.url.startsWith('/media/') || /^https:\/\//.test(item.url)) && list.findIndex(candidate => candidate.url === item.url) === index);
   const mainImage = cleanText(body.image, 500) || null;
   const coverImage = images.find(item => item.url === mainImage) || images[0] || null;
   const gallery = images.filter(item => item.url !== coverImage?.url);
