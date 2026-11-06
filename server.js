@@ -12,10 +12,12 @@ const Product = require('./src/models/Product');
 const Category = require('./src/models/Category');
 const Order = require('./src/models/Order');
 const SiteSettings = require('./src/models/SiteSettings');
-const { catalogCategories, starterProducts } = require('./src/catalog');
+const Visitor = require('./src/models/Visitor');
 const { buildWhatsAppMessage, configuredWhatsAppNumber, validateOrder } = require('./src/order');
 const { csrfProtection } = require('./src/security');
 const { localDirectory, storageStatus } = require('./src/storage');
+const { classifyDevice, detectBrowser, normalizePagePath } = require('./src/visitor');
+const { sendVisitorNotification } = require('./src/visitorNotifications');
 const adminRouter = require('./src/adminRouter');
 
 const app = express();
@@ -96,6 +98,7 @@ if (hasStaticFrontend) {
 }
 app.use('/media', express.static(localDirectory, { fallthrough: false, immutable: true, maxAge: '1y' }));
 const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 8, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many sign-in attempts. Wait 15 minutes and try again.' } });
+const visitorLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 120, standardHeaders: 'draft-7', legacyHeaders: false, message: { error: 'Too many visitor events. Try again later.' } });
 app.use('/api/admin/login', loginLimiter);
 app.get('/api/health', async (request, response) => {
   const databaseConnected = mongoose.connection.readyState === 1;
@@ -107,6 +110,56 @@ app.get('/api/health', async (request, response) => {
     timestamp: new Date().toISOString()
   });
 });
+app.post('/api/visitors', visitorLimiter, async (request, response) => {
+  if (mongoose.connection.readyState !== 1) {
+    return response.status(503).json({ error: 'Visitor tracking is temporarily unavailable.' });
+  }
+
+  const sessionId = String(request.body?.sessionId || '').toLowerCase();
+  const page = normalizePagePath(request.body?.page);
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(sessionId) || !page) {
+    return response.status(400).json({ error: 'A valid visitor session and page are required.' });
+  }
+
+  let visitor;
+  try {
+    visitor = await Visitor.create({
+      sessionId,
+      page,
+      device: classifyDevice(request.get('user-agent')),
+      browser: detectBrowser(request.get('user-agent'))
+    });
+  } catch (error) {
+    if (error.code === 11000) return response.json({ recorded: true, duplicate: true });
+    console.error('Could not record visitor activity:', error.message);
+    return response.status(503).json({ error: 'Visitor tracking is temporarily unavailable.' });
+  }
+
+  let notificationStatus = 'disabled';
+  try {
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
+    const notificationSettings = settings?.data?.visitorNotifications || {};
+    if (notificationSettings.enabled !== false) {
+      try {
+        await sendVisitorNotification(visitor, notificationSettings.recipientEmail);
+        notificationStatus = 'sent';
+      } catch (error) {
+        notificationStatus = 'failed';
+        console.error(`Visitor email notification failed for ${visitor._id}: ${error.message}`);
+      }
+    }
+  } catch (error) {
+    notificationStatus = 'failed';
+    console.error(`Visitor email notification settings could not be loaded for ${visitor._id}: ${error.message}`);
+  }
+
+  try {
+    await Visitor.updateOne({ _id: visitor._id }, { $set: { notificationStatus } });
+  } catch (error) {
+    console.error(`Could not update visitor notification status for ${visitor._id}: ${error.message}`);
+  }
+  response.status(201).json({ recorded: true });
+});
 app.use('/api/admin', csrfProtection, adminRouter);
 
 function publicProduct(product) {
@@ -115,8 +168,14 @@ function publicProduct(product) {
     : product.stockQuantity == null && product.availability !== 'out-of-stock'
       ? 'contact'
       : (product.availability || 'contact');
-  const resolvedPrice = product.pricingRule === 'storm-ice-quantity-offer' && Number.isInteger(product.price) ? product.price : (product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null);
+  const resolvedPrice = product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null;
   const weights = Array.isArray(product.weights) ? product.weights.map(weight => ({ label: String(weight.label || `${weight.value} lb`), value: Number(weight.value), available: Boolean(weight.available ?? true) })) : [];
+  const legacyImages = Array.isArray(product.images) && product.images.length
+    ? product.images
+    : [...(product.image ? [{ url: product.image, alt: product.imageAlt || '' }] : []), ...(product.gallery || [])];
+  const images = legacyImages.filter((item, index, list) => item?.url && list.findIndex(candidate => candidate?.url === item.url) === index);
+  const coverIndex = images.findIndex(item => item.url === product.image);
+  if (coverIndex > 0) images.unshift(...images.splice(coverIndex, 1));
   return {
     id: String(product._id || product.slug),
     slug: product.slug,
@@ -125,6 +184,7 @@ function publicProduct(product) {
     category: product.category,
     description: product.description,
     image: product.image || null,
+    images,
     price: resolvedPrice,
     salePrice: product.priceConfirmed === true && Number.isFinite(product.salePrice) ? product.salePrice : null,
     availability,
@@ -152,20 +212,62 @@ function errorPage(message, status) {
   return `<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Order enquiry not sent</title><body style="font:16px/1.6 system-ui,sans-serif;max-width:38rem;margin:12vh auto;padding:1.5rem;color:#171717"><h1>Order enquiry not sent</h1><p>${message}</p><p>Return to BowlersMechanic and try again, or contact the store directly.</p></body></html>`;
 }
 
+async function recordOrderRequest(body) {
+  if (mongoose.connection.readyState !== 1) {
+    const error = new Error('The order service is unavailable because the catalogue database is not connected. Your request was not recorded.');
+    error.status = 503;
+    throw error;
+  }
+
+  const settings = await SiteSettings.findOne({ key: 'main' }).lean();
+  const products = await Product.find({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
+  const result = validateOrder(body, products);
+  if (result.error) {
+    const error = new Error(result.error);
+    error.status = 400;
+    throw error;
+  }
+
+  const product = products.find(item => String(item._id || item.slug) === String(body.productId) || item.slug === String(body.productId));
+  const whatsappConfig = settings?.data?.whatsapp || {};
+  const prefix = String(whatsappConfig.referencePrefix || 'BM').replace(/[^A-Za-z0-9-]/g, '').slice(0, 8) || 'BM';
+  const reference = `${prefix}-${new Date().toISOString().slice(2, 10).replace(/-/g, '')}-${cryptoRandomReference()}`;
+  const order = await Order.create({
+    reference,
+    customer: { name: result.order.customerName, phone: result.order.customerPhone, email: result.order.email },
+    product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: result.order.product.price, quantity: result.order.quantity },
+    requirements: result.order.requirements,
+    status: 'request-recorded',
+    history: [{ status: 'request-recorded', note: 'Customer submitted the website form; WhatsApp message may not have been sent.' }]
+  });
+
+  return {
+    order,
+    reference,
+    result,
+    product,
+    settings,
+    whatsappNumber: orderWhatsAppNumber(settings?.data),
+    contactEmail: String((settings?.data?.site || {}).contactEmail || '').trim(),
+    whatsappConfig
+  };
+}
+
 app.get('/api/products', async (request, response) => {
-  const databaseConnected = mongoose.connection.readyState === 1;
+  response.set({ 'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate', Pragma: 'no-cache', Expires: '0' });
+  if (mongoose.connection.readyState !== 1) {
+    return response.status(503).json({ error: 'Product catalogue is unavailable because the database is not connected.' });
+  }
   try {
-    const products = databaseConnected
-      ? await Product.find({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).sort({ featured: -1, name: 1 }).lean()
-      : starterProducts;
-    const categories = databaseConnected ? await Category.find({ published: true }).sort({ sortOrder: 1, name: 1 }).select('slug name').lean() : [];
-    const settings = databaseConnected ? await SiteSettings.findOne({ key: 'main' }).lean() : null;
+    const products = await Product.find({ active: true, isStarter: { $ne: true }, $or: [{ status: 'published' }, { status: { $exists: false } }] }).sort({ featured: -1, name: 1 }).lean();
+    const categories = await Category.find({ published: true }).sort({ sortOrder: 1, name: 1 }).select('slug name').lean();
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
     response.json({
       products: products.map(publicProduct),
       categories,
       site: publicSiteSettings(settings?.data),
-      databaseConnected,
-      catalogMode: databaseConnected ? 'database' : 'starter-preview',
+      databaseConnected: true,
+      catalogMode: 'database',
       whatsappConfigured: Boolean(orderWhatsAppNumber(settings?.data))
     });
   } catch (error) {
@@ -181,7 +283,7 @@ function publicSiteSettings(data = {}) {
   const footer = data.footer || {};
   const navigation = Array.isArray(data.navigation) ? data.navigation : [];
   return {
-    site: { name: String(site.name || 'BowlersMechanic').slice(0, 100), currency: 'USD', announcement: String(site.announcement || '').slice(0, 240), announcementVisible: Boolean(site.announcementVisible), contactEmail: String(site.contactEmail || '').slice(0, 254), contactPhone: String(site.contactPhone || '').slice(0, 30) },
+    site: { name: String(site.name || 'BowlersMechanic').slice(0, 100), currency: 'USD', announcement: String(site.announcement || '').slice(0, 240), announcementVisible: Boolean(site.announcementVisible), contactEmail: String(site.contactEmail || '').slice(0, 254), contactPhone: String(site.contactPhone || '').slice(0, 30), whatsappNumber: orderWhatsAppNumber(data) || '' },
     homepage: {
       headline: String(homepage.headline || 'Find your next strike.').slice(0, 120),
       subtitle: String(homepage.subtitle || 'The right gear changes how you play. Explore the catalogue and talk directly with BowlersMechanic about your next setup.').slice(0, 500),
@@ -215,6 +317,23 @@ app.get('/api/site-config', async (request, response) => {
   }
 });
 
+app.post('/api/orders', async (request, response) => {
+  try {
+    const record = await recordOrderRequest(request.body);
+    response.status(201).json({
+      success: true,
+      order: { reference: record.reference },
+      whatsappNumber: record.whatsappNumber,
+      contactEmail: record.contactEmail,
+      message: 'Your order request has been recorded. You can continue via WhatsApp or email.'
+    });
+  } catch (error) {
+    const status = error.status >= 400 && error.status < 600 ? error.status : 500;
+    console.error('Could not record order request:', error.message);
+    response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
+  }
+});
+
 app.post('/api/orders/whatsapp', async (request, response) => {
   let settings;
   try {
@@ -223,40 +342,30 @@ app.post('/api/orders/whatsapp', async (request, response) => {
     console.error('Could not load WhatsApp ordering settings:', error.message);
     return response.status(503).type('html').send(errorPage('The order service is temporarily unavailable. No request was recorded.', 503));
   }
-  const whatsappConfig = settings?.data?.whatsapp;
+
   const whatsappNumber = orderWhatsAppNumber(settings?.data);
   if (!whatsappNumber) {
     return response.status(503).type('html').send(errorPage('The store WhatsApp number has not been configured with a complete international number. Please try again later.', 503));
   }
 
   try {
-    if (mongoose.connection.readyState !== 1) return response.status(503).type('html').send(errorPage('The order service is unavailable because the catalogue database is not connected. Your request was not recorded.', 503));
-    const products = await Product.find({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
-    const result = validateOrder(request.body, products);
-    if (result.error) return response.status(400).type('html').send(errorPage(result.error, 400));
-
-    const product = products.find(item => String(item._id || item.slug) === String(request.body.productId) || item.slug === String(request.body.productId));
-    const prefix = String(whatsappConfig?.referencePrefix || 'BM').replace(/[^A-Za-z0-9-]/g, '').slice(0, 8) || 'BM';
-    const reference = `${prefix}-${new Date().toISOString().slice(2, 10).replace(/-/g, '')}-${cryptoRandomReference()}`;
-    const order = await Order.create({
-      reference,
-      customer: { name: result.order.customerName, phone: result.order.customerPhone, email: result.order.email },
-      product: { productId: product._id, name: product.name, brand: product.brand, sku: product.sku || '', unitPrice: product.priceConfirmed === true && Number.isFinite(product.price) ? product.price : null, quantity: result.order.quantity },
-      requirements: result.order.requirements,
-      status: 'request-recorded',
-      history: [{ status: 'request-recorded', note: 'Customer submitted the website form; WhatsApp message may not have been sent.' }]
-    });
-    const substitutions = { reference, name: result.order.customerName, product: `${product.brand} ${product.name}`, quantity: String(result.order.quantity) };
+    const record = await recordOrderRequest(request.body);
+    const whatsappConfig = record.whatsappConfig;
+    const substitutions = { reference: record.reference, name: record.result.order.customerName, product: `${record.product.brand} ${record.product.name}`, quantity: String(record.result.order.quantity) };
     const customMessage = String(whatsappConfig?.defaultMessage || '').slice(0, 500).replace(/\{(reference|name|product|quantity)\}/g, (_, key) => substitutions[key]);
     const greeting = String(whatsappConfig?.greeting || '').trim().slice(0, 200);
-    const messageParts = [greeting, customMessage, buildWhatsAppMessage(result.order), `Order reference: ${reference}`].filter(Boolean);
+    const messageParts = [greeting, customMessage, buildWhatsAppMessage(record.result.order), `Order reference: ${record.reference}`].filter(Boolean);
     const message = encodeURIComponent(messageParts.join('\n\n'));
     response.set('Referrer-Policy', 'no-referrer');
     response.redirect(303, `https://wa.me/${whatsappNumber}?text=${message}`);
-    console.info(`Order request ${order.reference} recorded; WhatsApp send status is unknown.`);
+    console.info(`Order request ${record.reference} recorded; WhatsApp send status is unknown.`);
   } catch (error) {
+    const status = error.status >= 400 && error.status < 600 ? error.status : 500;
     console.error('Could not validate order against the catalogue:', error.message);
-    response.status(503).type('html').send(errorPage('The catalogue is temporarily unavailable, so this enquiry could not be checked. Please try again shortly.', 503));
+    if (mongoose.connection.readyState !== 1) {
+      return response.status(503).type('html').send(errorPage('The order service is unavailable because the catalogue database is not connected. Your request was not recorded.', 503));
+    }
+    response.status(status).type('html').send(errorPage(status === 400 ? error.message : 'The catalogue is temporarily unavailable, so this enquiry could not be checked. Please try again shortly.', status));
   }
 });
 
@@ -280,32 +389,20 @@ app.use((error, request, response, next) => {
   response.status(status).json({ error: status === 500 ? 'The server could not complete this request.' : error.message });
 });
 
-async function ensureCatalogSeed() {
-  if (mongoose.connection.readyState !== 1) return;
-  const categoryCount = await Category.countDocuments();
-  if (categoryCount === 0) {
-    await Category.insertMany(catalogCategories.map(category => ({ ...category, slug: String(category.slug).trim().toLowerCase() })));
-  }
-  const productCount = await Product.countDocuments();
-  if (productCount === 0) {
-    await Product.insertMany(starterProducts.map(product => ({ ...product, slug: String(product.slug).trim().toLowerCase() })));
-  }
-}
-
 function connectDatabase() {
   const uri = process.env.MONGODB_URI;
   if (!uri) {
-    console.warn('MONGODB_URI is not set. Serving the read-only starter catalogue; product changes are not persistent.');
+    console.warn('MONGODB_URI is not set. Public catalogue requests will fail until MongoDB is connected.');
     return Promise.resolve(false);
   }
 
   return mongoose.connect(uri).then(async () => {
     sessionStore.use(MongoStore.create({ client: mongoose.connection.getClient(), dbName: mongoose.connection.name, collectionName: 'admin_sessions', ttl: 8 * 60 * 60 }));
-    await ensureCatalogSeed();
+    await Visitor.createIndexes();
     console.log('Connected to MongoDB.');
     return true;
   }).catch(error => {
-    console.error(`MongoDB connection failed: ${error.message}`);
+    console.error(`MongoDB connection or visitor index initialization failed: ${error.message}`);
     return false;
   });
 }

@@ -12,9 +12,12 @@ const Order = require('./models/Order');
 const Media = require('./models/Media');
 const SiteSettings = require('./models/SiteSettings');
 const Activity = require('./models/Activity');
+const Visitor = require('./models/Visitor');
 const { createCsrfToken, requireAdmin, cleanText } = require('./security');
 const { deleteImage, putImage, storageStatus } = require('./storage');
 const { configuredWhatsAppNumber } = require('./order');
+const { visitorDateWindows } = require('./visitor');
+const { hasEmailConfiguration, sendTestEmail } = require('./visitorNotifications');
 
 const router = express.Router();
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: Number(process.env.MAX_IMAGE_BYTES) || 8 * 1024 * 1024, files: 10 } });
@@ -62,7 +65,11 @@ async function validateProduct(body) {
   if (stockQuantity === null && body.availability === 'available') return { error: 'Enter a verified stock quantity before marking this item in stock.' };
   const specifications = Array.isArray(body.specifications) ? body.specifications.slice(0, 40).map(item => ({ name: cleanText(item.name, 80), value: cleanText(item.value, 240) })).filter(item => item.name && item.value) : [];
   const tags = Array.isArray(body.tags) ? [...new Set(body.tags.slice(0, 30).map(tag => cleanText(tag, 40)).filter(Boolean))] : [];
-  const gallery = Array.isArray(body.gallery) ? body.gallery.slice(0, 12).map(item => ({ url: cleanText(item.url, 500), alt: cleanText(item.alt, 240) })).filter(item => item.url.startsWith('/media/') || /^https:\/\//.test(item.url)) : [];
+  const submittedImages = Array.isArray(body.images) ? body.images : Array.isArray(body.gallery) ? body.gallery : [];
+  const images = submittedImages.slice(0, 12).map(item => ({ url: cleanText(typeof item === 'string' ? item : item.url, 500), alt: cleanText(typeof item === 'string' ? '' : item.alt, 240) })).filter(item => item.url.startsWith('/media/') || /^https:\/\//.test(item.url));
+  const mainImage = cleanText(body.image, 500) || null;
+  const coverImage = images.find(item => item.url === mainImage) || images[0] || null;
+  const gallery = images.filter(item => item.url !== coverImage?.url);
   const status = body.status === 'draft' ? 'draft' : 'published';
   return { product: {
     name, brand, slug, category,
@@ -70,8 +77,8 @@ async function validateProduct(body) {
     description: cleanText(body.shortDescription || body.description, 1200),
     shortDescription: cleanText(body.shortDescription || body.description, 280),
     fullDescription: cleanText(body.fullDescription || body.description, 8000),
-    image: cleanText(body.image, 500) || null,
-    imageAlt: cleanText(body.imageAlt, 240), gallery,
+    image: coverImage?.url || mainImage,
+    imageAlt: cleanText(body.imageAlt || coverImage?.alt, 240), images, gallery,
     price, salePrice,
     priceConfirmed: Boolean(body.priceConfirmed && price !== null),
     stockQuantity,
@@ -79,7 +86,7 @@ async function validateProduct(body) {
     availability: ['available', 'out-of-stock', 'contact'].includes(body.availability) ? body.availability : 'contact',
     condition: ['unspecified', 'new', 'used', 'refurbished'].includes(body.condition) ? body.condition : 'unspecified',
     specifications, tags,
-    featured: Boolean(body.featured), active: status === 'published', status,
+    featured: Boolean(body.featured), isStarter: false, active: status === 'published', status,
     seoTitle: cleanText(body.seoTitle, 180), seoDescription: cleanText(body.seoDescription, 320)
   } };
 }
@@ -129,15 +136,95 @@ router.post('/logout', requireAdmin, async (request, response, next) => {
 
 router.use(requireAdmin);
 
+router.get('/visitors', requireDatabase, async (request, response, next) => {
+  try {
+    const windows = visitorDateWindows();
+    const [today, week, month, visitors] = await Promise.all([
+      Visitor.countDocuments({ createdAt: { $gte: windows.today } }),
+      Visitor.countDocuments({ createdAt: { $gte: windows.week } }),
+      Visitor.countDocuments({ createdAt: { $gte: windows.month } }),
+      Visitor.find().sort({ createdAt: -1 }).limit(100).select('createdAt page device browser notificationStatus').lean()
+    ]);
+    response.json({ stats: { today, week, month }, visitors });
+  } catch (error) { next(error); }
+});
+
+router.get('/visitor-notifications', requireDatabase, async (request, response, next) => {
+  try {
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
+    const notificationSettings = settings?.data?.visitorNotifications || {};
+    const savedRecipient = String(notificationSettings.recipientEmail || '').trim();
+    const recipientEmail = savedRecipient || String(process.env.VISITOR_NOTIFICATION_EMAIL || '').trim();
+    response.json({
+      enabled: notificationSettings.enabled !== false,
+      recipientEmail: request.session.admin.role === 'owner' ? recipientEmail : '',
+      usesEnvironmentRecipient: request.session.admin.role === 'owner' && !savedRecipient && Boolean(String(process.env.VISITOR_NOTIFICATION_EMAIL || '').trim()),
+      emailConfigured: hasEmailConfiguration(recipientEmail)
+    });
+  } catch (error) { next(error); }
+});
+
+router.put('/visitor-notifications', requireDatabase, requireOwner, async (request, response, next) => {
+  try {
+    const enabled = request.body?.enabled;
+    const recipientEmail = String(request.body?.recipientEmail || '').trim();
+    if (typeof enabled !== 'boolean') return response.status(400).json({ error: 'Choose whether visitor email alerts are enabled.' });
+    if (recipientEmail.length > 254 || (recipientEmail && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(recipientEmail))) {
+      return response.status(400).json({ error: 'Enter a valid notification recipient email address.' });
+    }
+
+    const current = await SiteSettings.findOne({ key: 'main' }) || new SiteSettings({ key: 'main', data: {} });
+    const data = current.data?.toObject ? current.data.toObject() : { ...(current.data || {}) };
+    data.visitorNotifications = { ...(data.visitorNotifications || {}), enabled, recipientEmail };
+    current.data = data;
+    current.updatedBy = request.session.admin.id;
+    await current.save();
+    await logActivity(request.session.admin, 'visitor-notifications.update', 'settings', current._id, 'Updated visitor email notification settings');
+
+    const effectiveRecipient = recipientEmail || String(process.env.VISITOR_NOTIFICATION_EMAIL || '').trim();
+    response.json({
+      enabled,
+      recipientEmail: effectiveRecipient,
+      usesEnvironmentRecipient: !recipientEmail && Boolean(String(process.env.VISITOR_NOTIFICATION_EMAIL || '').trim()),
+      emailConfigured: hasEmailConfiguration(effectiveRecipient)
+    });
+  } catch (error) { next(error); }
+});
+
+router.post('/visitor-notifications/test-email', requireDatabase, requireOwner, async (request, response) => {
+  try {
+    const settings = await SiteSettings.findOne({ key: 'main' }).lean();
+    const recipient = String(settings?.data?.visitorNotifications?.recipientEmail || process.env.VISITOR_NOTIFICATION_EMAIL || '').trim();
+    if (!hasEmailConfiguration(recipient)) {
+      return response.status(503).json({ error: 'Configure RESEND_API_KEY, VISITOR_NOTIFICATION_FROM, and a recipient email before sending a test.' });
+    }
+    await sendTestEmail(recipient);
+    response.json({ sent: true });
+  } catch (error) {
+    console.error(`Visitor test email failed: ${error.message}`);
+    response.status(502).json({ error: 'The test email could not be sent. Check the Resend configuration and server logs.' });
+  }
+});
+
 router.get('/dashboard', requireDatabase, async (request, response, next) => {
   try {
-    const [total, published, drafts, orders, pending, confirmed, delivered, categoryCount, recentOrders, activities, settings] = await Promise.all([
+    const windows = visitorDateWindows();
+    const [total, published, drafts, orders, pending, confirmed, delivered, categoryCount, recentOrders, activities, settings, visitorsToday, visitorsWeek, visitorsMonth, recentVisitors] = await Promise.all([
       Product.countDocuments(), Product.countDocuments({ $or: [{ status: 'published' }, { status: { $exists: false } }] }), Product.countDocuments({ status: 'draft' }),
       Order.countDocuments(), Order.countDocuments({ status: 'request-recorded' }), Order.countDocuments({ status: 'confirmed' }), Order.countDocuments({ status: 'delivered' }),
       Category.countDocuments({ published: true }), Order.find().sort({ createdAt: -1 }).limit(6).select('reference customer.name product.name status createdAt').lean(),
-      Activity.find().sort({ createdAt: -1 }).limit(8).select('actorEmail action summary createdAt').lean(), SiteSettings.findOne({ key: 'main' }).lean()
+      Activity.find().sort({ createdAt: -1 }).limit(8).select('actorEmail action summary createdAt').lean(), SiteSettings.findOne({ key: 'main' }).lean(),
+      Visitor.countDocuments({ createdAt: { $gte: windows.today } }), Visitor.countDocuments({ createdAt: { $gte: windows.week } }),
+      Visitor.countDocuments({ createdAt: { $gte: windows.month } }), Visitor.find().sort({ createdAt: -1 }).limit(6).select('createdAt page device browser').lean()
     ]);
-    response.json({ stats: { products: total, published, drafts, orders, pending, confirmed, delivered, categories: categoryCount }, recentOrders, activities, status: { database: 'connected', storage: storageStatus(), whatsappConfigured: Boolean((settings?.data?.whatsapp?.enabled && configuredWhatsAppNumber(settings.data.whatsapp.number)) || configuredWhatsAppNumber()), website: 'online' } });
+    response.json({
+      stats: { products: total, published, drafts, orders, pending, confirmed, delivered, categories: categoryCount },
+      visitorStats: { today: visitorsToday, week: visitorsWeek, month: visitorsMonth },
+      recentVisitors,
+      recentOrders,
+      activities,
+      status: { database: 'connected', storage: storageStatus(), whatsappConfigured: Boolean((settings?.data?.whatsapp?.enabled && configuredWhatsAppNumber(settings.data.whatsapp.number)) || configuredWhatsAppNumber()), website: 'online' }
+    });
   } catch (error) { next(error); }
 });
 

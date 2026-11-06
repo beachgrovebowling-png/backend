@@ -29,13 +29,13 @@ test('order validation accepts only listed payment methods and includes preferen
   assert.match(validateOrder({ ...body, paymentMethod: 'Bitcoin' }, products).error, /supported payment method/);
 });
 
-test('WhatsApp message uses contact-for-price wording and no confirmation claim', () => {
+test('WhatsApp message uses contact-for-price wording without the order disclaimer', () => {
   const message = buildWhatsAppMessage({
     customerName: 'Alex Rider', customerPhone: '2025550142', email: '', quantity: 1, requirements: '',
     product: { brand: 'Motiv', name: 'Venom Shock', price: null }
   });
   assert.match(message, /Price: Contact for price/);
-  assert.match(message, /not an order confirmation/);
+  assert.doesNotMatch(message, /Please confirm availability and final order details|not an order confirmation/);
   assert.doesNotMatch(message, /\$0\.00/);
 });
 
@@ -50,9 +50,10 @@ test('HTTP endpoints expose readiness only and refuse incomplete WhatsApp redire
   try {
     const catalogueResponse = await fetch(`${baseUrl}/api/products`);
     const catalogue = await catalogueResponse.json();
-    assert.equal(catalogue.catalogMode, 'starter-preview');
-    assert.equal(catalogue.whatsappConfigured, false);
-    assert.equal(JSON.stringify(catalogue).includes('12025550142'), false);
+    assert.equal(catalogueResponse.status, 503);
+    assert.match(catalogueResponse.headers.get('cache-control'), /no-store/);
+    assert.match(catalogue.error, /database is not connected/);
+    assert.equal(Object.hasOwn(catalogue, 'products'), false);
 
     const orderResponse = await fetch(`${baseUrl}/api/orders/whatsapp`, {
       method: 'POST',
@@ -74,6 +75,44 @@ test('HTTP endpoints expose readiness only and refuse incomplete WhatsApp redire
     assert.equal(configuredResponse.status, 503);
     assert.equal(configuredResponse.headers.get('location'), null);
     assert.match(await configuredResponse.text(), /request was not recorded/);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+    if (previousNumber === undefined) delete process.env.WHATSAPP_NUMBER;
+    else process.env.WHATSAPP_NUMBER = previousNumber;
+  }
+});
+
+test('order pricing uses the current confirmed database price and sale price', () => {
+  const body = { customerName: 'Alex Rider', customerPhone: '+1 202 555 0142', productId: 'storm-ice-spare-ball', quantity: '2', paymentMethod: 'Zelle' };
+  const products = [{ slug: 'storm-ice-spare-ball', name: 'Spare Ball', brand: 'Storm', price: 180, salePrice: 145, priceConfirmed: true }];
+  assert.equal(validateOrder(body, products).order.product.price, 145);
+  assert.equal(validateOrder(body, [{ ...products[0], salePrice: null }]).order.product.price, 180);
+});
+
+test('HTTP order endpoint records requests without a configured WhatsApp number', async () => {
+  const previousNumber = process.env.WHATSAPP_NUMBER;
+  delete process.env.WHATSAPP_NUMBER;
+  const { app } = require('../server');
+  const server = app.listen(0);
+  const address = server.address();
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  try {
+    const response = await fetch(`${baseUrl}/api/orders`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        customerName: 'Alex Rider',
+        customerPhone: '2025550142',
+        productId: 'motiv-venom-shock',
+        quantity: '1',
+        paymentMethod: 'Zelle',
+        requirements: 'Please confirm shipping.'
+      })
+    });
+
+    assert.equal(response.status, 503);
+    assert.match(await response.text(), /database is not connected|temporarily unavailable/i);
   } finally {
     await new Promise(resolve => server.close(resolve));
     if (previousNumber === undefined) delete process.env.WHATSAPP_NUMBER;
