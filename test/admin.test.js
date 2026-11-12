@@ -142,7 +142,7 @@ test('admin authentication, CSRF, private dashboard, and logout use Mongo-backed
 
     const productResponse = await fetch(`${baseUrl}/api/admin/products`, {
       method: 'POST', headers: { Cookie: cookie, 'x-csrf-token': login.csrfToken, 'content-type': 'application/json' },
-      body: JSON.stringify({ name: 'Temporary CMS QA Product', brand: 'QA only', slug: `${categorySlug}-product`, category: categorySlug, shortDescription: 'Temporary test listing', price: null, availability: 'contact', stockQuantity: null, status: 'draft', active: false })
+      body: JSON.stringify({ name: 'Temporary CMS QA Product', brand: 'Storm', slug: `${categorySlug}-product`, category: categorySlug, shortDescription: 'Temporary test listing', price: null, availability: 'contact', stockQuantity: null, status: 'draft', active: false })
     });
     assert.equal(productResponse.status, 201);
     productId = (await productResponse.json()).product._id;

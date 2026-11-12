@@ -13,6 +13,7 @@ const Media = require('./models/Media');
 const SiteSettings = require('./models/SiteSettings');
 const Activity = require('./models/Activity');
 const Visitor = require('./models/Visitor');
+const { normalizeBallBrand } = require('./brands');
 const { createCsrfToken, requireAdmin, cleanText } = require('./security');
 const { deleteImage, putImage, storageStatus } = require('./storage');
 const { configuredWhatsAppNumber } = require('./order');
@@ -49,13 +50,13 @@ function makeSlug(value) {
 
 async function validateProduct(body) {
   const name = cleanText(body.name, 120);
-  const brand = cleanText(body.brand, 80);
+  const brand = normalizeBallBrand(cleanText(body.brand, 80));
   const slug = makeSlug(body.slug || name);
   const category = cleanText(body.category, 40);
   const price = validPrice(body.price);
   const salePrice = validPrice(body.salePrice);
   const stockQuantity = body.stockQuantity === '' || body.stockQuantity == null ? null : Number(body.stockQuantity);
-  if (name.length < 2 || !brand || !slug) return { error: 'Name, brand, and a valid URL slug are required.' };
+  if (name.length < 2 || !brand || !slug) return { error: 'Enter a product name, choose one of the supported bowling brands, and provide a valid URL slug.' };
   const builtInCategories = ['bowling-ball', 'accessory', 'bag', 'apparel', 'other'];
   if (!builtInCategories.includes(category) && !await Category.exists({ slug: category })) return { error: 'Choose a category managed by the store.' };
   if (Number.isNaN(price) || Number.isNaN(salePrice)) return { error: 'Prices must be valid non-negative USD amounts.' };

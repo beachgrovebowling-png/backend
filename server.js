@@ -10,7 +10,6 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const Product = require('./src/models/Product');
 const Category = require('./src/models/Category');
-const Brand = require('./src/models/Brand');
 const Order = require('./src/models/Order');
 const SiteSettings = require('./src/models/SiteSettings');
 const Visitor = require('./src/models/Visitor');
@@ -20,6 +19,7 @@ const { localDirectory, storageStatus } = require('./src/storage');
 const { classifyDevice, detectBrowser, normalizePagePath } = require('./src/visitor');
 const { sendVisitorNotification } = require('./src/visitorNotifications');
 const { checkR2Connection, classifyR2Error, logR2ConnectionResult } = require('./src/storage');
+const { BALL_BRANDS } = require('./src/brands');
 const adminRouter = require('./src/adminRouter');
 
 const app = express();
@@ -212,14 +212,16 @@ function publicProduct(product) {
   };
 }
 
-function publishedProductQuery() {
-  return {
+function publishedProductQuery(supportedBrandsOnly = false) {
+  const query = {
     isStarter: { $ne: true },
     $and: [
       { $or: [{ status: 'published' }, { status: { $exists: false } }] },
       { $or: [{ active: true }, { active: { $exists: false } }] }
     ]
   };
+  if (supportedBrandsOnly) query.brand = { $in: BALL_BRANDS };
+  return query;
 }
 
 function orderWhatsAppNumber(data) {
@@ -278,20 +280,13 @@ app.get('/api/products', async (request, response) => {
     return response.status(503).json({ error: 'Product catalogue is unavailable because the database is not connected.' });
   }
   try {
-    const products = await Product.find(publishedProductQuery()).sort({ featured: -1, name: 1 }).lean();
+    const products = await Product.find(publishedProductQuery(true)).sort({ featured: -1, name: 1 }).lean();
     const categories = await Category.find({ published: true }).sort({ sortOrder: 1, name: 1 }).select('slug name').lean();
-    const managedBrands = await Brand.find({ published: true }).sort({ name: 1 }).select('name').lean();
-    const brandNames = new Map();
-    managedBrands.forEach(brand => brandNames.set(brand.name.toLocaleLowerCase(), brand.name));
-    products.forEach(product => {
-      const name = String(product.brand || '').trim();
-      if (name && !brandNames.has(name.toLocaleLowerCase())) brandNames.set(name.toLocaleLowerCase(), name);
-    });
     const settings = await SiteSettings.findOne({ key: 'main' }).lean();
     response.json({
       products: products.map(publicProduct),
       categories,
-      brands: [...brandNames.values()].sort((left, right) => left.localeCompare(right)),
+      brands: BALL_BRANDS,
       site: publicSiteSettings(settings?.data),
       databaseConnected: true,
       catalogMode: 'database',
