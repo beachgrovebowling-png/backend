@@ -10,6 +10,7 @@ const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
 const Product = require('./src/models/Product');
 const Category = require('./src/models/Category');
+const Brand = require('./src/models/Brand');
 const Order = require('./src/models/Order');
 const SiteSettings = require('./src/models/SiteSettings');
 const Visitor = require('./src/models/Visitor');
@@ -211,6 +212,16 @@ function publicProduct(product) {
   };
 }
 
+function publishedProductQuery() {
+  return {
+    isStarter: { $ne: true },
+    $and: [
+      { $or: [{ status: 'published' }, { status: { $exists: false } }] },
+      { $or: [{ active: true }, { active: { $exists: false } }] }
+    ]
+  };
+}
+
 function orderWhatsAppNumber(data) {
   if (data?.whatsapp) return data.whatsapp.enabled ? configuredWhatsAppNumber(data.whatsapp.number) : null;
   return configuredWhatsAppNumber();
@@ -228,7 +239,7 @@ async function recordOrderRequest(body) {
   }
 
   const settings = await SiteSettings.findOne({ key: 'main' }).lean();
-  const products = await Product.find({ active: true, $or: [{ status: 'published' }, { status: { $exists: false } }] }).lean();
+  const products = await Product.find(publishedProductQuery()).lean();
   const result = validateOrder(body, products);
   if (result.error) {
     const error = new Error(result.error);
@@ -267,12 +278,20 @@ app.get('/api/products', async (request, response) => {
     return response.status(503).json({ error: 'Product catalogue is unavailable because the database is not connected.' });
   }
   try {
-    const products = await Product.find({ active: true, isStarter: { $ne: true }, $or: [{ status: 'published' }, { status: { $exists: false } }] }).sort({ featured: -1, name: 1 }).lean();
+    const products = await Product.find(publishedProductQuery()).sort({ featured: -1, name: 1 }).lean();
     const categories = await Category.find({ published: true }).sort({ sortOrder: 1, name: 1 }).select('slug name').lean();
+    const managedBrands = await Brand.find({ published: true }).sort({ name: 1 }).select('name').lean();
+    const brandNames = new Map();
+    managedBrands.forEach(brand => brandNames.set(brand.name.toLocaleLowerCase(), brand.name));
+    products.forEach(product => {
+      const name = String(product.brand || '').trim();
+      if (name && !brandNames.has(name.toLocaleLowerCase())) brandNames.set(name.toLocaleLowerCase(), name);
+    });
     const settings = await SiteSettings.findOne({ key: 'main' }).lean();
     response.json({
       products: products.map(publicProduct),
       categories,
+      brands: [...brandNames.values()].sort((left, right) => left.localeCompare(right)),
       site: publicSiteSettings(settings?.data),
       databaseConnected: true,
       catalogMode: 'database',
